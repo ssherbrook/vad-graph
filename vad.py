@@ -1,3 +1,5 @@
+import wave
+
 import numpy as np
 import pyaudio
 import pyqtgraph as pg
@@ -23,6 +25,30 @@ def int2float(sound):
     return sound
 
 
+# Helper function to convert float32 to int16
+def float2int(sound):
+    sound = np.clip(sound, -1, 1)
+    sound = sound * 32768
+    return sound.astype(np.int16)
+
+
+# Helper function for automatic gain control with attack and release
+def apply_agc(sound, current_gain, sample_rate, attack_time=0.1, release_time=0.01):
+    target_level = 0.2
+    rms = np.sqrt(np.mean(sound**2))
+    if rms > 0:
+        gain = target_level / rms
+        attack_coeff = np.exp(-1.0 / (sample_rate * attack_time))
+        release_coeff = np.exp(-1.0 / (sample_rate * release_time))
+        if gain > current_gain:
+            current_gain = (1 - attack_coeff) * gain + attack_coeff * current_gain
+        else:
+            current_gain = (1 - release_coeff) * gain + release_coeff * current_gain
+        sound = sound * current_gain
+        sound = np.clip(sound, -1, 1)  # Ensure we don't exceed [-1, 1]
+    return sound, current_gain
+
+
 # Audio stream parameters
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
@@ -45,6 +71,8 @@ class AudioStream(QThread):
             stream_callback=self.callback,
         )
         self.model = model
+        self.frames = []
+        self.current_gain = 1.0
 
     def run(self):
         self.stream.start_stream()
@@ -55,13 +83,27 @@ class AudioStream(QThread):
         audio_chunk = np.frombuffer(in_data, dtype=np.int16)
         audio_float32 = int2float(audio_chunk)
         confidence = self.model(torch.from_numpy(audio_float32), SAMPLE_RATE).item()
-        self.update_plot.emit(audio_chunk, confidence)
+        if confidence > 0.5:
+            audio_float32, self.current_gain = apply_agc(
+                audio_float32, self.current_gain, SAMPLE_RATE
+            )
+        audio_chunk = float2int(audio_float32)
+        self.frames.append(audio_chunk.tobytes())
+        self.update_plot.emit(audio_float32, confidence)
         return (in_data, pyaudio.paContinue)
 
     def stop(self):
         self.stream.stop_stream()
         self.stream.close()
         self.audio.terminate()
+
+        # Save audio to file
+        wf = wave.open("output_with_agc.wav", "wb")
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(self.audio.get_sample_size(FORMAT))
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(b"".join(self.frames))
+        wf.close()
 
 
 class MainWindow(QMainWindow):
@@ -81,7 +123,7 @@ class MainWindow(QMainWindow):
         self.graph_layout = pg.GraphicsLayoutWidget()
 
         self.plot_audio = self.graph_layout.addPlot(row=0, col=0)
-        self.plot_audio.setYRange(-32768, 32767)  # Fixed y-axis for int16 range
+        self.plot_audio.setYRange(-1, 1)  # Fixed y-axis for normalized float32 range
         self.plot_audio.setXRange(0, 5, padding=0)  # Fixed x-axis for 5 seconds
         self.plot_data = self.plot_audio.plot(self.data, pen="b")
 

@@ -1,144 +1,178 @@
-import queue
-
 import numpy as np
 import pyaudio
 import pyqtgraph as pg
 import webrtcvad
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
-# Initialize PyAudio and WebRTC VAD
-audio = pyaudio.PyAudio()
-vad = webrtcvad.Vad()
+FS = 16000  # Sampling rate
+CHUNKSZ = int(FS / 1000 * 30)  # 30 ms frames
 
-# Set the VAD mode (0-3), higher values are more aggressive in filtering out non-speech
-vad.set_mode(1)
 
-# Define audio stream parameters
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 16000
-CHUNK = int(RATE / 1000 * 30)  # 30 ms frames
-
-# Enumerate audio input devices
-info = audio.get_host_api_info_by_index(0)
-numdevices = info.get("deviceCount")
-devices = []
-for i in range(0, numdevices):
-    if audio.get_device_info_by_host_api_device_index(0, i).get("maxInputChannels") > 0:
-        devices.append(
-            (i, audio.get_device_info_by_host_api_device_index(0, i).get("name"))
+class MicrophoneRecorder:
+    def __init__(self, signal):
+        self.signal = signal
+        self.p = pyaudio.PyAudio()
+        self.stream = self.p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=FS,
+            input=True,
+            frames_per_buffer=CHUNKSZ,
         )
 
-print("Available audio input devices:")
-for i, device in devices:
-    print(f"{i}: {device}")
+    def read(self):
+        data = self.stream.read(CHUNKSZ, exception_on_overflow=False)
+        y = np.frombuffer(data, dtype=np.int16)
+        self.signal.emit(y)
 
-# Get user's choice of audio input device
-device_index = int(input("Select the device index: "))
-
-# Queue to store audio data for plotting
-audio_queue = queue.Queue()
-
-
-# Callback function to process audio data
-def callback(in_data, frame_count, time_info, status):
-    audio_data = np.frombuffer(in_data, dtype=np.int16)
-    try:
-        is_speech = vad.is_speech(in_data, RATE)
-    except webrtcvad.Error as e:
-        print(f"VAD error: {e}")
-        is_speech = False
-    audio_queue.put((audio_data, is_speech))
-    return (in_data, pyaudio.paContinue)
+    def close(self):
+        self.stream.stop_stream()
+        self.stream.close()
+        self.p.terminate()
 
 
-# Open audio stream
-stream = audio.open(
-    format=FORMAT,
-    channels=CHANNELS,
-    rate=RATE,
-    input=True,
-    input_device_index=device_index,
-    frames_per_buffer=CHUNK,
-    stream_callback=callback,
-)
+class SpectrogramWidget(pg.PlotItem):
+    read_collected = QtCore.Signal(np.ndarray)
 
-# Start the stream
-stream.start_stream()
+    def __init__(self):
+        super(SpectrogramWidget, self).__init__()
 
-# Set up pyqtgraph window and plots
-app = QtWidgets.QApplication([])
-win = pg.GraphicsLayoutWidget(show=True, title="Real-Time Audio Plot")
-win.resize(1000, 600)
+        self.img = pg.ImageItem()
+        self.addItem(self.img)
 
-# Waveform plot
-waveform_plot = win.addPlot(title="Audio Signal")
-waveform_curve = waveform_plot.plot()
-waveform_plot.setYRange(-32768, 32767)
-waveform_plot.setLabel("left", "Amplitude")
-waveform_plot.setLabel("bottom", "Time", units="s")
+        # To show 5 seconds of data, we need FS * 5 / CHUNKSZ chunks of data
+        self.img_array = np.zeros((int(FS * 5 / CHUNKSZ), int(CHUNKSZ / 2 + 1)))
 
-# Data buffer for the plot (increase size to show more time)
-data_buffer = np.zeros(
-    CHUNK * 100
-)  # Buffer to hold 100 chunks of data (3 seconds at 16000 Hz)
+        # bipolar colormap
+        pos = np.array([0.0, 1.0, 0.5, 0.25, 0.75])
+        color = np.array(
+            [
+                [0, 255, 255, 255],
+                [255, 255, 0, 255],
+                [0, 0, 0, 255],
+                (0, 0, 255, 255),
+                (255, 0, 0, 255),
+            ],
+            dtype=np.ubyte,
+        )
+        cmap = pg.ColorMap(pos, color)
+        lut = cmap.getLookupTable(0.0, 1.0, 256)
 
-# Set x-axis range to match the data buffer size
-waveform_plot.setXRange(0, len(data_buffer))
+        # set colormap
+        self.img.setLookupTable(lut)
+        self.img.setLevels([-50, 40])
 
-# List to store vertical lines indicating voice activity
-voice_activity_lines = []
-is_speech_active = False
+        # setup the correct scaling for y-axis
+        freq = np.arange((CHUNKSZ / 2) + 1) / (float(CHUNKSZ) / FS)
+        yscale = 1.0 / (self.img_array.shape[1] / freq[-1])
+        transform = QtGui.QTransform()
+        transform.scale((5.0 / self.img_array.shape[0]), yscale)
+        self.img.setTransform(transform)
+
+        self.setLabel("left", "Frequency", units="Hz")
+        self.setLabel("bottom", "Time", units="s")
+
+        # prepare window for later use
+        self.win = np.hanning(CHUNKSZ)
+        self.show()
+
+    def update(self, chunk):
+        # normalized, windowed frequencies in data chunk
+        spec = np.fft.rfft(chunk * self.win) / CHUNKSZ
+        # get magnitude
+        psd = np.abs(spec)
+        # convert to dB scale
+        psd = 20 * np.log10(psd)
+
+        # roll down one and replace leading edge with new data
+        self.img_array = np.roll(self.img_array, -1, 0)
+        self.img_array[-1, :] = psd
+
+        self.img.setImage(self.img_array, autoLevels=False)
 
 
-def update_plot():
-    global data_buffer, voice_activity_lines, is_speech_active
-    if not audio_queue.empty():
-        audio_data, is_speech = audio_queue.get()
+class AudioPlotWidget(pg.GraphicsLayoutWidget):
+    def __init__(self):
+        super(AudioPlotWidget, self).__init__()
+        self.resize(1000, 600)
+        self.setWindowTitle("Real-Time Audio Plot and Spectrogram")
 
+        self.audio_plot = self.addPlot(title="Audio Signal")
+        self.audio_curve = self.audio_plot.plot()
+        self.audio_plot.setYRange(-32768, 32767)
+        self.audio_plot.setLabel("left", "Amplitude")
+        self.audio_plot.setLabel("bottom", "Time", units="s")
+        self.audio_plot.setXRange(0, 5)  # Set x-axis to display 5 seconds of data
+        self.nextRow()
+
+        self.spectrogram_plot = SpectrogramWidget()
+        self.addItem(self.spectrogram_plot)
+
+        self.data_buffer = np.zeros(
+            CHUNKSZ * int(FS * 5 / CHUNKSZ)
+        )  # Buffer to hold 5 seconds of data
+        self.voice_activity_lines = []
+        self.is_speech_active = False
+
+        self.vad = webrtcvad.Vad()
+        self.vad.set_mode(3)  # Set VAD mode (0-3), higher values are more aggressive
+
+        self.spectrogram_plot.read_collected.connect(self.update)
+
+    def update(self, audio_data):
         # Update waveform
-        data_buffer = np.roll(data_buffer, -CHUNK)
-        data_buffer[-CHUNK:] = audio_data
-        waveform_curve.setData(data_buffer)
+        self.data_buffer = np.roll(self.data_buffer, -CHUNKSZ)
+        self.data_buffer[-CHUNKSZ:] = audio_data
+        time_axis = np.linspace(0, 5, len(self.data_buffer))
+        self.audio_curve.setData(time_axis, self.data_buffer)
 
         # Handle voice activity lines
-        current_time = len(data_buffer) - CHUNK
+        current_time = len(self.data_buffer) / FS
+        is_speech = self.vad.is_speech(audio_data.tobytes(), FS)
 
-        if is_speech and not is_speech_active:
+        if is_speech and not self.is_speech_active:
             # Add a new line at the start of speech
             line = pg.InfiniteLine(pos=current_time, angle=90, pen=pg.mkPen("r"))
-            waveform_plot.addItem(line)
-            voice_activity_lines.append({"line": line, "type": "start"})
-            is_speech_active = True
-        elif not is_speech and is_speech_active:
+            self.audio_plot.addItem(line)
+            self.voice_activity_lines.append({"line": line, "type": "start"})
+            self.is_speech_active = True
+        elif not is_speech and self.is_speech_active:
             # Add a new line at the end of speech
             line = pg.InfiniteLine(pos=current_time, angle=90, pen=pg.mkPen("g"))
-            waveform_plot.addItem(line)
-            voice_activity_lines.append({"line": line, "type": "end"})
-            is_speech_active = False
+            self.audio_plot.addItem(line)
+            self.voice_activity_lines.append({"line": line, "type": "end"})
+            self.is_speech_active = False
 
-        waveform_plot.setTitle("Speech Detected" if is_speech else "No Speech Detected")
+        self.audio_plot.setTitle(
+            "Speech Detected" if is_speech else "No Speech Detected"
+        )
 
         # Remove lines that are no longer visible
-        for activity in voice_activity_lines:
-            activity["line"].setPos(activity["line"].value() - CHUNK)
-        voice_activity_lines = [
+        for activity in self.voice_activity_lines:
+            activity["line"].setPos(activity["line"].value() - CHUNKSZ / FS)
+        self.voice_activity_lines = [
             activity
-            for activity in voice_activity_lines
+            for activity in self.voice_activity_lines
             if activity["line"].value() > 0
         ]
 
+        # Update spectrogram
+        self.spectrogram_plot.update(audio_data)
 
-# Set up a timer to update the plot periodically
-timer = QtCore.QTimer()
-timer.timeout.connect(update_plot)
-timer.start(30)
 
-# Start Qt event loop
 if __name__ == "__main__":
+    app = QtWidgets.QApplication([])
+    w = AudioPlotWidget()
+
+    mic = MicrophoneRecorder(w.spectrogram_plot.read_collected)
+
+    # time (seconds) between reads
+    interval = FS / CHUNKSZ
+    t = QtCore.QTimer()
+    t.timeout.connect(mic.read)
+    t.start(1000 / interval)  # QTimer takes ms
+
+    w.show()
     app.exec()
 
-# Stop and close the stream
-stream.stop_stream()
-stream.close()
-audio.terminate()
+    mic.close()

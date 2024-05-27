@@ -1,3 +1,4 @@
+import time
 import wave
 
 import numpy as np
@@ -6,6 +7,7 @@ import pyqtgraph as pg
 import torch
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
+from scipy.signal import butter, sosfilt, sosfilt_zi
 
 # Set up the VAD model
 torch.set_num_threads(1)
@@ -32,21 +34,18 @@ def float2int(sound):
     return sound.astype(np.int16)
 
 
-# Helper function for automatic gain control with attack and release
-def apply_agc(sound, current_gain, sample_rate, attack_time=0.1, release_time=0.01):
-    target_level = 0.2
-    rms = np.sqrt(np.mean(sound**2))
-    if rms > 0:
-        gain = target_level / rms
-        attack_coeff = np.exp(-1.0 / (sample_rate * attack_time))
-        release_coeff = np.exp(-1.0 / (sample_rate * release_time))
-        if gain > current_gain:
-            current_gain = (1 - attack_coeff) * gain + attack_coeff * current_gain
-        else:
-            current_gain = (1 - release_coeff) * gain + release_coeff * current_gain
-        sound = sound * current_gain
-        sound = np.clip(sound, -1, 1)  # Ensure we don't exceed [-1, 1]
-    return sound, current_gain
+# Bandpass filter design
+def butter_bandpass(lowcut, highcut, fs, order=3):
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    sos = butter(order, [low, high], btype="band", output="sos")
+    return sos
+
+
+def bandpass_filter(data, sos, zi):
+    y, zf = sosfilt(sos, data, zi=zi)
+    return y, zf
 
 
 # Audio stream parameters
@@ -72,7 +71,10 @@ class AudioStream(QThread):
         )
         self.model = model
         self.frames = []
-        self.current_gain = 1.0
+        self.sos = butter_bandpass(200, 7000, SAMPLE_RATE)  # Initialize filter
+        self.zi = sosfilt_zi(self.sos)
+        self.last_above_threshold_time = time.time()
+        self.initialized = False  # To ensure proper initialization
 
     def run(self):
         self.stream.start_stream()
@@ -82,15 +84,34 @@ class AudioStream(QThread):
     def callback(self, in_data, frame_count, time_info, status):
         audio_chunk = np.frombuffer(in_data, dtype=np.int16)
         audio_float32 = int2float(audio_chunk)
-        confidence = self.model(torch.from_numpy(audio_float32), SAMPLE_RATE).item()
+
+        # Initialize filter state with silence to avoid oscillation
+        if not self.initialized:
+            silence = np.zeros(CHUNK, dtype=np.float32)
+            _, self.zi = sosfilt(self.sos, silence, zi=self.zi)
+            self.initialized = True
+
+        # Apply bandpass filter
+        audio_filtered, self.zi = bandpass_filter(audio_float32, self.sos, self.zi)
+
+        # Convert to torch.float32
+        audio_tensor = torch.from_numpy(audio_filtered).float()
+
+        confidence = self.model(audio_tensor, SAMPLE_RATE).item()
+
+        current_time = time.time()
         if confidence > 0.5:
-            audio_float32, self.current_gain = apply_agc(
-                audio_float32, self.current_gain, SAMPLE_RATE
-            )
-        audio_chunk = float2int(audio_float32)
+            self.last_above_threshold_time = current_time
+            audio_chunk = float2int(audio_filtered)
+        else:
+            if current_time - self.last_above_threshold_time >= 0.5:
+                audio_chunk = np.zeros_like(audio_chunk)
+            else:
+                audio_chunk = float2int(audio_filtered)
+
         self.frames.append(audio_chunk.tobytes())
-        self.update_plot.emit(audio_float32, confidence)
-        return (in_data, pyaudio.paContinue)
+        self.update_plot.emit(audio_filtered, confidence)
+        return (audio_chunk.tobytes(), pyaudio.paContinue)
 
     def stop(self):
         self.stream.stop_stream()
@@ -98,7 +119,7 @@ class AudioStream(QThread):
         self.audio.terminate()
 
         # Save audio to file
-        wf = wave.open("output_with_agc.wav", "wb")
+        wf = wave.open("output_with_agc_and_filter.wav", "wb")
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(self.audio.get_sample_size(FORMAT))
         wf.setframerate(SAMPLE_RATE)
